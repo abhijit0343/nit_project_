@@ -5,125 +5,185 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
+from tqdm import tqdm
 
-# Hyperparameters
-HIDDEN_SIZE = 32
-NUM_LAYERS = 2
-BATCH_SIZE = 16
-LEARNING_RATE = 0.001
-EPOCHS = 600
-WEIGHT_DECAY = 1e-4
+from model import ActionLSTM
+
+# ─────────────────────────── Hyperparameters ────────────────────────────────
+HIDDEN_SIZE    = 128      # increased from 64 for better capacity
+NUM_LAYERS     = 2
+BATCH_SIZE     = 64       # larger batch -> better GPU utilisation
+LEARNING_RATE  = 1e-3
+EPOCHS         = 300
+WEIGHT_DECAY   = 1e-4
+PATIENCE       = 30       # early-stopping patience (epochs without val-loss improvement)
+NUM_WORKERS    = 0        # set >0 only on Linux; Windows multiprocessing in DataLoader is tricky
+# ─────────────────────────────────────────────────────────────────────────────
+
 
 class PoseDataset(Dataset):
     def __init__(self, X, y):
         self.X = torch.tensor(X, dtype=torch.float32)
         self.y = torch.tensor(y, dtype=torch.long)
-        
+
     def __len__(self):
         return len(self.y)
-        
+
     def __getitem__(self, idx):
         return self.X[idx], self.y[idx]
 
-class ActionLSTM(nn.Module):
-    def __init__(self, input_size, hidden_size, num_layers, num_classes):
-        super(ActionLSTM, self).__init__()
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout=0.5)
-        self.dropout = nn.Dropout(0.5)
-        self.fc = nn.Linear(hidden_size, num_classes)
-        
-    def forward(self, x):
-        # Initialize hidden state and cell state
-        h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(x.device)
-        c0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(x.device)
-        
-        # Forward propagate LSTM
-        out, _ = self.lstm(x, (h0, c0))
-        
-        # Decode the hidden state of the last time step
-        out = self.dropout(out[:, -1, :])
-        out = self.fc(out)
-        return out
+
+def evaluate(model, loader, criterion, device):
+    """Returns (avg_loss, accuracy%) over the given loader."""
+    model.eval()
+    total_loss, correct, total = 0.0, 0, 0
+    with torch.no_grad():
+        for batch_X, batch_y in loader:
+            batch_X, batch_y = batch_X.to(device), batch_y.to(device)
+            outputs = model(batch_X)
+            loss = criterion(outputs, batch_y)
+            total_loss += loss.item()
+            _, predicted = torch.max(outputs, 1)
+            total += batch_y.size(0)
+            correct += (predicted == batch_y).sum().item()
+    avg_loss = total_loss / len(loader)
+    accuracy = 100.0 * correct / total
+    return avg_loss, accuracy
+
 
 def main():
-    # Setup device
+    # ── GPU setup ────────────────────────────────────────────────────────────
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
+    print(f"{'='*60}")
+    print(f"  Device : {device}")
+    if device.type == 'cuda':
+        print(f"  GPU    : {torch.cuda.get_device_name(0)}")
+        print(f"  VRAM   : {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+        torch.backends.cudnn.benchmark = True   # faster cuDNN kernels after warm-up
+    print(f"{'='*60}\n")
 
-    # Load data
+    # ── Load data ────────────────────────────────────────────────────────────
     try:
-        X = np.load('X.npy')
-        y = np.load('y.npy')
-        actions = np.load('actions.npy')
-    except FileNotFoundError:
-        print("Data files not found. Please run Phase 2 first.")
+        if os.path.exists('X_aug.npy') and os.path.exists('y_aug.npy'):
+            X = np.load('X_aug.npy')
+            y = np.load('y_aug.npy')
+            print("Loaded augmented dataset  (X_aug.npy / y_aug.npy)")
+        else:
+            X = np.load('X.npy')
+            y = np.load('y.npy')
+            print("Loaded raw dataset  (X.npy / y.npy)")
+        actions = np.load('actions.npy', allow_pickle=True)
+    except FileNotFoundError as e:
+        print(f"[ERROR] Data file not found: {e}")
+        print("Please run Phase 2 (data collection) first.")
+        return
+
+    if X.ndim != 3 or X.shape[0] == 0:
+        print("[ERROR] X.npy is empty or has wrong shape. Run Phase 2 first.")
         return
 
     num_classes = len(actions)
-    input_size = X.shape[2] # 132 features
+    input_size  = X.shape[2]   # 231 features per frame
+    print(f"  Dataset : {X.shape[0]} sequences  |  {num_classes} classes  |  {input_size} features/frame\n")
 
-    # Train/Test Split (80% train, 20% test)
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
-    
-    print(f"Training data shape: {X_train.shape}")
-    print(f"Testing data shape: {X_test.shape}")
+    # ── Train / Val / Test split  (70 / 15 / 15) ────────────────────────────
+    X_train, X_temp, y_train, y_temp = train_test_split(
+        X, y, test_size=0.30, random_state=42, stratify=y)
+    X_val, X_test, y_val, y_test = train_test_split(
+        X_temp, y_temp, test_size=0.50, random_state=42, stratify=y_temp)
 
-    # DataLoaders
-    train_dataset = PoseDataset(X_train, y_train)
-    test_dataset = PoseDataset(X_test, y_test)
-    
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
+    print(f"  Train  : {X_train.shape[0]} sequences")
+    print(f"  Val    : {X_val.shape[0]} sequences")
+    print(f"  Test   : {X_test.shape[0]} sequences\n")
 
-    # Initialize model
+    # ── DataLoaders ─────────────────────────────────────────────────────────
+    pin = (device.type == 'cuda')
+    train_loader = DataLoader(PoseDataset(X_train, y_train),
+                              batch_size=BATCH_SIZE, shuffle=True,
+                              num_workers=NUM_WORKERS, pin_memory=pin)
+    val_loader   = DataLoader(PoseDataset(X_val, y_val),
+                              batch_size=BATCH_SIZE, shuffle=False,
+                              num_workers=NUM_WORKERS, pin_memory=pin)
+    test_loader  = DataLoader(PoseDataset(X_test, y_test),
+                              batch_size=BATCH_SIZE, shuffle=False,
+                              num_workers=NUM_WORKERS, pin_memory=pin)
+
+    # ── Model ────────────────────────────────────────────────────────────────
     model = ActionLSTM(input_size, HIDDEN_SIZE, NUM_LAYERS, num_classes).to(device)
-    
-    # Loss and optimizer
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"  Model parameters : {total_params:,}\n")
 
-    print("Starting training...")
-    
-    for epoch in range(EPOCHS):
+    # ── Loss / Optimiser / Scheduler ─────────────────────────────────────────
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=10, min_lr=1e-6, verbose=True)
+
+    # ── Training loop ────────────────────────────────────────────────────────
+    print(f"Starting training for up to {EPOCHS} epochs  (early-stop patience={PATIENCE})...\n")
+    best_val_loss  = float('inf')
+    epochs_no_improve = 0
+    best_model_path = 'action_model_best.pth'
+
+    for epoch in range(1, EPOCHS + 1):
+        # --- Train ---
         model.train()
-        total_loss = 0
-        for batch_X, batch_y in train_loader:
-            batch_X, batch_y = batch_X.to(device), batch_y.to(device)
-            
-            # Forward pass
+        train_loss = 0.0
+        loop = tqdm(train_loader, desc=f"Epoch {epoch:>3}/{EPOCHS} [train]",
+                    leave=False, unit="batch")
+        for batch_X, batch_y in loop:
+            batch_X, batch_y = batch_X.to(device, non_blocking=True), \
+                               batch_y.to(device, non_blocking=True)
+            optimizer.zero_grad(set_to_none=True)
             outputs = model(batch_X)
             loss = criterion(outputs, batch_y)
-            
-            # Backward and optimize
-            optimizer.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
-            
-            total_loss += loss.item()
-            
-        if (epoch+1) % 50 == 0:
-            print(f'Epoch [{epoch+1}/{EPOCHS}], Loss: {total_loss/len(train_loader):.4f}')
+            train_loss += loss.item()
+            loop.set_postfix(loss=f"{loss.item():.4f}")
 
-    # Evaluate the model
-    model.eval()
-    correct = 0
-    total = 0
-    with torch.no_grad():
-        for batch_X, batch_y in test_loader:
-            batch_X, batch_y = batch_X.to(device), batch_y.to(device)
-            outputs = model(batch_X)
-            _, predicted = torch.max(outputs.data, 1)
-            total += batch_y.size(0)
-            correct += (predicted == batch_y).sum().item()
+        avg_train_loss = train_loss / len(train_loader)
 
-    accuracy = 100 * correct / total
-    print(f'\nTest Accuracy: {accuracy:.2f}%')
+        # --- Validate ---
+        val_loss, val_acc = evaluate(model, val_loader, criterion, device)
+        scheduler.step(val_loss)
 
-    # Save the model
+        # --- Log ---
+        print(f"Epoch {epoch:>3}/{EPOCHS}  "
+              f"train_loss={avg_train_loss:.4f}  "
+              f"val_loss={val_loss:.4f}  "
+              f"val_acc={val_acc:.1f}%  "
+              f"lr={optimizer.param_groups[0]['lr']:.2e}")
+
+        # --- Best model checkpoint ---
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            epochs_no_improve = 0
+            torch.save(model.state_dict(), best_model_path)
+        else:
+            epochs_no_improve += 1
+
+        # --- Early stopping ---
+        if epochs_no_improve >= PATIENCE:
+            print(f"\n[Early Stop] No improvement for {PATIENCE} epochs. Stopping.")
+            break
+
+    # ── Final evaluation on test set ─────────────────────────────────────────
+    print(f"\nLoading best model from '{best_model_path}'...")
+    model.load_state_dict(torch.load(best_model_path, map_location=device))
+    test_loss, test_acc = evaluate(model, test_loader, criterion, device)
+
+    print(f"\n{'='*60}")
+    print(f"  Test Loss     : {test_loss:.4f}")
+    print(f"  Test Accuracy : {test_acc:.2f}%")
+    print(f"{'='*60}\n")
+
+    # Save final model (same weights as best)
     torch.save(model.state_dict(), 'action_model.pth')
-    print("Model saved to 'action_model.pth'")
+    print("Saved  ->  action_model.pth  (best checkpoint)")
+    print("Saved  ->  action_model_best.pth  (same best checkpoint, kept separately)")
+
 
 if __name__ == '__main__':
     main()

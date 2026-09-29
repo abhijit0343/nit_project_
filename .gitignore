@@ -3,3 +3,8 @@
 *.task
 *.crdownload
 Unconfirmed*
+.venv/
+node_modules/
+dataset/
+__pycache__/
+*.rar
