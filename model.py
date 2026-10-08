@@ -1,70 +1,44 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+import torchvision.models as models
 
 
-class SelfAttention(nn.Module):
-    """Additive (Bahdanau-style) self-attention over a sequence of LSTM outputs."""
-
-    def __init__(self, hidden_size):
-        super(SelfAttention, self).__init__()
-        self.attention = nn.Linear(hidden_size, 1)
-
-    def forward(self, lstm_outputs):
-        # lstm_outputs: (batch, seq_len, hidden_size)
-        attn_scores  = self.attention(torch.tanh(lstm_outputs))   # (batch, seq_len, 1)
-        attn_weights = F.softmax(attn_scores, dim=1)              # (batch, seq_len, 1)
-        context      = torch.sum(attn_weights * lstm_outputs, dim=1)  # (batch, hidden_size)
-        return context, attn_weights
-
-
-class ActionLSTM(nn.Module):
+class LiquidClassifier(nn.Module):
     """
-    Bidirectional LSTM + Self-Attention model for skeleton-based action recognition.
+    MobileNetV3-Small fine-tuned for liquid classification
+    (e.g. mustard oil vs water).
+
+    The ImageNet-pretrained backbone acts as a frozen feature extractor;
+    only the lightweight custom head is trained by default, which keeps
+    training fast even on small datasets.
 
     Args:
-        input_size  : feature dimension per time-step (231 for 33 landmarks × 7 features)
-        hidden_size : LSTM hidden units per direction (default 128)
-        num_layers  : stacked LSTM layers (default 2)
-        num_classes : number of action classes
+        num_classes     : number of output liquid classes (default 2)
+        freeze_backbone : if True, backbone weights are frozen (default True)
     """
 
-    def __init__(self, input_size, hidden_size=128, num_layers=2, num_classes=10):
-        super(ActionLSTM, self).__init__()
-        self.hidden_size  = hidden_size
-        self.num_layers   = num_layers
+    def __init__(self, num_classes: int = 2, freeze_backbone: bool = True):
+        super().__init__()
 
-        # Layer normalisation on the raw input helps training stability
-        self.input_norm = nn.LayerNorm(input_size)
+        # Load MobileNetV3-Small with ImageNet weights
+        backbone = models.mobilenet_v3_small(weights=models.MobileNet_V3_Small_Weights.IMAGENET1K_V1)
 
-        # Bidirectional LSTM — output dim is hidden_size * 2
-        self.lstm = nn.LSTM(
-            input_size, hidden_size, num_layers,
-            batch_first=True, dropout=0.4, bidirectional=True)
+        # Optionally freeze the feature extractor
+        if freeze_backbone:
+            for param in backbone.features.parameters():
+                param.requires_grad = False
 
-        # Attention works on the concatenated bidirectional output
-        self.attention = SelfAttention(hidden_size * 2)
-
-        self.dropout = nn.Dropout(0.4)
-
-        # Classification head
-        self.fc = nn.Sequential(
-            nn.Linear(hidden_size * 2, hidden_size),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(hidden_size, num_classes),
+        # The default MobileNetV3-Small classifier expects 576 input features
+        # Replace it with our custom binary/multi-class head
+        backbone.classifier = nn.Sequential(
+            nn.Linear(576, 256),
+            nn.Hardswish(),
+            nn.Dropout(p=0.3),
+            nn.Linear(256, num_classes),
         )
 
-    def forward(self, x):
-        # x: (batch, seq_len, input_size)
-        x = self.input_norm(x)
+        self.model = backbone
 
-        # LSTM forward pass (h0/c0 default to zeros when not provided)
-        out, _ = self.lstm(x)   # out: (batch, seq_len, hidden_size * 2)
-
-        # Attention pooling
-        context, _ = self.attention(out)   # (batch, hidden_size * 2)
-
-        out = self.dropout(context)
-        out = self.fc(out)                 # (batch, num_classes)
-        return out
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x : (batch, 3, 224, 224)
+        return self.model(x)   # returns raw logits (batch, num_classes)

@@ -13,15 +13,15 @@ import urllib.request
 import subprocess
 import time
 
-WHEEL_URL = "https://download.pytorch.org/whl/cu121/torch-2.5.1%2Bcu121-cp311-cp311-win_amd64.whl"
-WHEEL_FILE = "torch-2.5.1+cu121-cp311-cp311-win_amd64.whl"
-TOTAL_SIZE_GB = 2.45
+WHEEL_URL = "https://download.pytorch.org/whl/cu124/torch-2.5.1%2Bcu124-cp311-cp311-win_amd64.whl"
+WHEEL_FILE = "torch-2.5.1+cu124-cp311-cp311-win_amd64.whl"
+TOTAL_SIZE_GB = 2.51
 
-TORCHVISION_URL = "https://download.pytorch.org/whl/cu121/torchvision-0.20.1%2Bcu121-cp311-cp311-win_amd64.whl"
-TORCHVISION_FILE = "torchvision-0.20.1+cu121-cp311-cp311-win_amd64.whl"
+TORCHVISION_URL = "https://download.pytorch.org/whl/cu124/torchvision-0.20.1%2Bcu124-cp311-cp311-win_amd64.whl"
+TORCHVISION_FILE = "torchvision-0.20.1+cu124-cp311-cp311-win_amd64.whl"
 
-TORCHAUDIO_URL = "https://download.pytorch.org/whl/cu121/torchaudio-2.5.1%2Bcu121-cp311-cp311-win_amd64.whl"
-TORCHAUDIO_FILE = "torchaudio-2.5.1+cu121-cp311-cp311-win_amd64.whl"
+TORCHAUDIO_URL = "https://download.pytorch.org/whl/cu124/torchaudio-2.5.1%2Bcu124-cp311-cp311-win_amd64.whl"
+TORCHAUDIO_FILE = "torchaudio-2.5.1+cu124-cp311-cp311-win_amd64.whl"
 
 
 def download_with_resume(url: str, dest: str, description: str = ""):
@@ -123,9 +123,9 @@ def main():
         return
 
     wheels = [
-        (WHEEL_URL, WHEEL_FILE, "torch 2.5.1+cu121 (2.45 GB)"),
-        (TORCHVISION_URL, TORCHVISION_FILE, "torchvision 0.20.1+cu121"),
-        (TORCHAUDIO_URL, TORCHAUDIO_FILE, "torchaudio 2.5.1+cu121"),
+        (WHEEL_URL, WHEEL_FILE, "torch 2.5.1+cu124 (2.51 GB)"),
+        (TORCHVISION_URL, TORCHVISION_FILE, "torchvision 0.20.1+cu124"),
+        (TORCHAUDIO_URL, TORCHAUDIO_FILE, "torchaudio 2.5.1+cu124"),
     ]
 
     for url, filename, desc in wheels:

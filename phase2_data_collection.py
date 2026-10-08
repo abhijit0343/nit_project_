@@ -1,135 +1,134 @@
+"""
+phase2_data_collection.py — Frame Extractor for Liquid Classifier
+==================================================================
+Reads MP4 videos from dataset/my_dataset/<class>/ folders and
+extracts sampled JPEG frames into frames/<class>/ ready for
+torchvision.datasets.ImageFolder in Phase 3 training.
+
+Duplicate videos (same MD5 hash) are automatically skipped.
+
+Usage:
+    python phase2_data_collection.py
+"""
+
 import os
 import cv2
-import numpy as np
-import mediapipe as mp
-from mediapipe.tasks import python
-from mediapipe.tasks.python import vision
-from concurrent.futures import ProcessPoolExecutor, as_completed
+import hashlib
 from tqdm import tqdm
 
-# Settings
-DATASET_DIR = 'dataset/UCF-101/'
-SEQUENCE_LENGTH = 30
-NUM_ACTIONS = 10          # How many action classes to use
-MAX_VIDEOS_PER_ACTION = 50  # Cap per class to keep collection time reasonable
+# ──────────────────────────── Config ────────────────────────────────────────
+DATASET_DIR  = r'dataset\my_dataset'   # root containing one folder per class
+OUTPUT_DIR   = r'frames'               # where extracted JPEGs are saved
+FRAME_STEP   = 5                       # sample 1 frame every FRAME_STEP frames
+RESIZE       = (224, 224)              # MobileNetV3 input resolution
+JPEG_QUALITY = 95                      # JPEG compression quality (0-100)
+# ─────────────────────────────────────────────────────────────────────────────
 
-from feature_extraction import extract_keypoints
+
+def md5_of_file(path: str) -> str:
+    """Return MD5 hex-digest of a file — used to detect exact duplicates."""
+    h = hashlib.md5()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(65536), b''):
+            h.update(chunk)
+    return h.hexdigest()
 
 
-def process_video(args):
+def extract_frames(video_path: str, out_folder: str, vid_idx: int) -> int:
     """
-    Worker function: processes a single video file and returns a list of
-    (sequence, label) pairs.  Each call creates its own MediaPipe landmarker
-    so it is safe to run in a subprocess.
+    Extract every FRAME_STEP-th frame from a video, resize to RESIZE,
+    and save as JPEG.  Returns number of frames saved.
     """
-    video_path, label, model_asset_path = args
-
-    base_options = python.BaseOptions(model_asset_path=model_asset_path)
-    options = vision.PoseLandmarkerOptions(
-        base_options=base_options,
-        running_mode=vision.RunningMode.VIDEO,
-        min_pose_detection_confidence=0.5,
-        min_pose_presence_confidence=0.5,
-        min_tracking_confidence=0.5,
-    )
-    landmarker = vision.PoseLandmarker.create_from_options(options)
-
     cap = cv2.VideoCapture(video_path)
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    if fps == 0 or np.isnan(fps):
-        fps = 30.0
+    if not cap.isOpened():
+        print(f"  [WARN] Cannot open: {video_path}")
+        return 0
 
-    frames_buffer = []
-    prev_keypoints = None
-    frame_timestamp_ms = 0       # per-video timestamp — avoids the global-state bug
-    sequences = []
+    saved = 0
+    frame_idx = 0
 
-    while cap.isOpened():
+    while True:
         ret, frame = cap.read()
         if not ret:
             break
 
-        image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=image_rgb)
+        if frame_idx % FRAME_STEP == 0:
+            resized = cv2.resize(frame, RESIZE, interpolation=cv2.INTER_AREA)
+            filename = f"vid_{vid_idx:03d}_frame_{frame_idx:05d}.jpg"
+            out_path = os.path.join(out_folder, filename)
+            cv2.imwrite(out_path, resized, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+            saved += 1
 
-        frame_timestamp_ms += int(1000 / fps)
-        results = landmarker.detect_for_video(mp_image, frame_timestamp_ms)
-
-        keypoints = extract_keypoints(results.pose_landmarks, prev_keypoints)
-        prev_keypoints = keypoints
-        frames_buffer.append(keypoints)
-
-        if len(frames_buffer) == SEQUENCE_LENGTH:
-            sequences.append((np.array(frames_buffer, dtype=np.float32), label))
-            frames_buffer = []   # non-overlapping windows
+        frame_idx += 1
 
     cap.release()
-    landmarker.close()
-    return sequences
+    return saved
 
 
 def main():
-    # Resolve absolute path so subprocesses can find the model file
-    model_asset_path = os.path.abspath('pose_landmarker_full.task')
-
-    # Discover actions (sorted for reproducibility; pick first NUM_ACTIONS)
-    all_folders = sorted([
+    # Discover class folders
+    class_folders = sorted([
         f for f in os.listdir(DATASET_DIR)
         if os.path.isdir(os.path.join(DATASET_DIR, f))
     ])
-    actions = np.array(all_folders[:NUM_ACTIONS])
-    print(f"Using {len(actions)} action classes: {list(actions)}")
 
-    label_map = {label: num for num, label in enumerate(actions)}
-
-    # Build work list: (video_path, label_int, model_path)
-    tasks = []
-    for action in actions:
-        action_path = os.path.join(DATASET_DIR, action)
-        videos = [f for f in os.listdir(action_path) if f.endswith(('.avi', '.mp4'))]
-        videos = videos[:MAX_VIDEOS_PER_ACTION]
-        for vf in videos:
-            tasks.append((os.path.join(action_path, vf), label_map[action], model_asset_path))
-
-    print(f"Total videos to process: {len(tasks)}")
-
-    all_sequences, all_labels = [], []
-
-    # Use up to 4 workers (MediaPipe is CPU-bound; more workers = faster collection)
-    num_workers = min(4, os.cpu_count() or 1)
-    print(f"Processing with {num_workers} parallel workers...")
-
-    with ProcessPoolExecutor(max_workers=num_workers) as executor:
-        future_to_task = {executor.submit(process_video, t): t for t in tasks}
-        with tqdm(total=len(tasks), desc="Extracting keypoints", unit="video") as pbar:
-            for future in as_completed(future_to_task):
-                task = future_to_task[future]
-                try:
-                    seqs = future.result()
-                    for seq, lbl in seqs:
-                        all_sequences.append(seq)
-                        all_labels.append(lbl)
-                except Exception as exc:
-                    print(f"\n[WARNING] {task[0]} failed: {exc}")
-                finally:
-                    pbar.update(1)
-
-    if not all_sequences:
-        print("No sequences extracted. Check your dataset path and video files.")
+    if not class_folders:
+        print(f"[ERROR] No class folders found in '{DATASET_DIR}'.")
         return
 
-    X = np.array(all_sequences, dtype=np.float32)
-    y = np.array(all_labels, dtype=np.int64)
+    print(f"\nFound {len(class_folders)} classes: {class_folders}")
+    print(f"Output directory : {OUTPUT_DIR}")
+    print(f"Frame step       : every {FRAME_STEP} frames")
+    print(f"Resize           : {RESIZE[0]}×{RESIZE[1]}\n")
 
-    print(f"\nData collection complete!")
-    print(f"  X shape : {X.shape}  (sequences, frames, features)")
-    print(f"  y shape : {y.shape}")
-    print(f"  Classes : {dict(zip(actions, [int((y==i).sum()) for i in range(len(actions))]))} ")
+    total_frames = 0
 
-    np.save('X.npy', X)
-    np.save('y.npy', y)
-    np.save('actions.npy', actions)
-    print("Saved  ->  X.npy, y.npy, actions.npy")
+    for cls in class_folders:
+        cls_input  = os.path.join(DATASET_DIR, cls)
+        # Use sanitised folder name (replace spaces) for the output directory
+        cls_safe   = cls.replace(' ', '_').lower()
+        cls_output = os.path.join(OUTPUT_DIR, cls_safe)
+        os.makedirs(cls_output, exist_ok=True)
+
+        # Collect all MP4 / AVI files
+        videos = [
+            os.path.join(cls_input, f)
+            for f in sorted(os.listdir(cls_input))
+            if f.lower().endswith(('.mp4', '.avi', '.mov'))
+        ]
+
+        if not videos:
+            print(f"  [{cls}] No video files found — skipping.")
+            continue
+
+        # Deduplicate by MD5
+        seen_hashes = set()
+        unique_videos = []
+        for vp in videos:
+            h = md5_of_file(vp)
+            if h not in seen_hashes:
+                seen_hashes.add(h)
+                unique_videos.append(vp)
+
+        skipped = len(videos) - len(unique_videos)
+        print(f"  [{cls}]  {len(videos)} videos found  ->  "
+              f"{len(unique_videos)} unique  "
+              f"({skipped} duplicate(s) skipped)")
+
+        cls_frames = 0
+        for vid_idx, vp in enumerate(tqdm(unique_videos, desc=f"  Extracting [{cls}]", unit="video")):
+            n = extract_frames(vp, cls_output, vid_idx)
+            cls_frames += n
+
+        print(f"           -> {cls_frames} frames saved to '{cls_output}'\n")
+        total_frames += cls_frames
+
+    print(f"{'='*55}")
+    print(f"  Frame extraction complete!")
+    print(f"  Total frames saved : {total_frames}")
+    print(f"  Output root        : {os.path.abspath(OUTPUT_DIR)}")
+    print(f"{'='*55}\n")
+    print("Next step -> run:  python phase3_model_training.py")
 
 
 if __name__ == '__main__':

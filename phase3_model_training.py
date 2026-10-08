@@ -1,156 +1,195 @@
+"""
+phase3_model_training.py — CNN Fine-Tuning for Liquid Classifier
+=================================================================
+Trains a MobileNetV3-Small model on the JPEG frames extracted by
+phase2_data_collection.py, then saves the best weights.
+
+Usage:
+    python phase3_model_training.py
+"""
+
 import os
+import sys
+import copy
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
-from sklearn.model_selection import train_test_split
+from torch.utils.data import DataLoader, WeightedRandomSampler, Subset
+from torchvision import datasets, transforms
+from sklearn.model_selection import StratifiedShuffleSplit
+from sklearn.metrics import classification_report, confusion_matrix
 from tqdm import tqdm
 
-from model import ActionLSTM
+from model import LiquidClassifier
 
-# ─────────────────────────── Hyperparameters ────────────────────────────────
-HIDDEN_SIZE    = 128      # increased from 64 for better capacity
-NUM_LAYERS     = 2
-BATCH_SIZE     = 64       # larger batch -> better GPU utilisation
-LEARNING_RATE  = 1e-3
-EPOCHS         = 300
-WEIGHT_DECAY   = 1e-4
-PATIENCE       = 30       # early-stopping patience (epochs without val-loss improvement)
-NUM_WORKERS    = 0        # set >0 only on Linux; Windows multiprocessing in DataLoader is tricky
+# ──────────────────────────── Hyperparameters ────────────────────────────────
+FRAMES_DIR    = 'frames'                # root of extracted JPEG frames
+MODEL_SAVE    = 'liquid_classifier.pth' # best model weights
+LABELS_SAVE   = 'liquid_classes.npy'   # class-name array
+BATCH_SIZE    = 32
+EPOCHS        = 30
+LEARNING_RATE = 1e-3
+WEIGHT_DECAY  = 1e-4
+PATIENCE      = 5                       # early-stop patience (val-loss)
+VAL_SPLIT     = 0.20                    # 80/20 train-val split
+NUM_WORKERS   = 0                       # keep 0 on Windows
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ImageNet normalisation — required because backbone was pretrained on ImageNet
+IMAGENET_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_STD  = [0.229, 0.224, 0.225]
 
-class PoseDataset(Dataset):
-    def __init__(self, X, y):
-        self.X = torch.tensor(X, dtype=torch.float32)
-        self.y = torch.tensor(y, dtype=torch.long)
 
-    def __len__(self):
-        return len(self.y)
+def get_transforms():
+    train_tf = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomRotation(15),
+        transforms.ColorJitter(brightness=0.3, contrast=0.2, saturation=0.2, hue=0.1),
+        transforms.ToTensor(),
+        transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+    ])
+    val_tf = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+    ])
+    return train_tf, val_tf
 
-    def __getitem__(self, idx):
-        return self.X[idx], self.y[idx]
+
+def make_weighted_sampler(labels):
+    """Returns a WeightedRandomSampler that balances class frequencies."""
+    class_counts = np.bincount(labels)
+    weights = 1.0 / class_counts[labels]
+    return WeightedRandomSampler(weights=torch.DoubleTensor(weights),
+                                 num_samples=len(weights), replacement=True)
 
 
 def evaluate(model, loader, criterion, device):
-    """Returns (avg_loss, accuracy%) over the given loader."""
+    """Returns (avg_loss, accuracy%, all_preds, all_labels)."""
     model.eval()
     total_loss, correct, total = 0.0, 0, 0
+    all_preds, all_labels = [], []
+
     with torch.no_grad():
-        for batch_X, batch_y in loader:
-            batch_X, batch_y = batch_X.to(device), batch_y.to(device)
-            outputs = model(batch_X)
-            loss = criterion(outputs, batch_y)
+        for imgs, labels in loader:
+            imgs, labels = imgs.to(device), labels.to(device)
+            outputs = model(imgs)
+            loss = criterion(outputs, labels)
             total_loss += loss.item()
-            _, predicted = torch.max(outputs, 1)
-            total += batch_y.size(0)
-            correct += (predicted == batch_y).sum().item()
-    avg_loss = total_loss / len(loader)
-    accuracy = 100.0 * correct / total
-    return avg_loss, accuracy
+            _, preds = torch.max(outputs, 1)
+            correct += (preds == labels).sum().item()
+            total   += labels.size(0)
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+
+    return total_loss / len(loader), 100.0 * correct / total, all_preds, all_labels
 
 
 def main():
-    # ── GPU setup ────────────────────────────────────────────────────────────
+    # ── Device ───────────────────────────────────────────────────────────────
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"{'='*60}")
+    print(f"\n{'='*60}")
     print(f"  Device : {device}")
     if device.type == 'cuda':
         print(f"  GPU    : {torch.cuda.get_device_name(0)}")
         print(f"  VRAM   : {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
-        torch.backends.cudnn.benchmark = True   # faster cuDNN kernels after warm-up
+        torch.backends.cudnn.benchmark = True
     print(f"{'='*60}\n")
 
-    # ── Load data ────────────────────────────────────────────────────────────
-    try:
-        if os.path.exists('X_aug.npy') and os.path.exists('y_aug.npy'):
-            X = np.load('X_aug.npy')
-            y = np.load('y_aug.npy')
-            print("Loaded augmented dataset  (X_aug.npy / y_aug.npy)")
-        else:
-            X = np.load('X.npy')
-            y = np.load('y.npy')
-            print("Loaded raw dataset  (X.npy / y.npy)")
-        actions = np.load('actions.npy', allow_pickle=True)
-    except FileNotFoundError as e:
-        print(f"[ERROR] Data file not found: {e}")
-        print("Please run Phase 2 (data collection) first.")
+    # ── Sanity check ─────────────────────────────────────────────────────────
+    if not os.path.isdir(FRAMES_DIR):
+        print(f"[ERROR] Frames directory '{FRAMES_DIR}' not found.")
+        print("Please run phase2_data_collection.py first.")
         return
 
-    if X.ndim != 3 or X.shape[0] == 0:
-        print("[ERROR] X.npy is empty or has wrong shape. Run Phase 2 first.")
-        return
+    # ── Load full dataset (val transform first to get labels) ────────────────
+    train_tf, val_tf = get_transforms()
 
-    num_classes = len(actions)
-    input_size  = X.shape[2]   # 231 features per frame
-    print(f"  Dataset : {X.shape[0]} sequences  |  {num_classes} classes  |  {input_size} features/frame\n")
+    full_dataset = datasets.ImageFolder(FRAMES_DIR, transform=val_tf)
+    classes      = full_dataset.classes
+    num_classes  = len(classes)
+    all_labels   = np.array([s[1] for s in full_dataset.samples])
 
-    # ── Train / Val / Test split  (70 / 15 / 15) ────────────────────────────
-    X_train, X_temp, y_train, y_temp = train_test_split(
-        X, y, test_size=0.30, random_state=42, stratify=y)
-    X_val, X_test, y_val, y_test = train_test_split(
-        X_temp, y_temp, test_size=0.50, random_state=42, stratify=y_temp)
+    print(f"  Classes   : {classes}")
+    print(f"  Total frames : {len(full_dataset)}")
+    for i, cls in enumerate(classes):
+        print(f"    [{i}] {cls:20s} -> {(all_labels == i).sum()} frames")
+    print()
 
-    print(f"  Train  : {X_train.shape[0]} sequences")
-    print(f"  Val    : {X_val.shape[0]} sequences")
-    print(f"  Test   : {X_test.shape[0]} sequences\n")
+    # ── Stratified 80/20 split ───────────────────────────────────────────────
+    sss = StratifiedShuffleSplit(n_splits=1, test_size=VAL_SPLIT, random_state=42)
+    train_idx, val_idx = next(sss.split(np.zeros(len(all_labels)), all_labels))
 
-    # ── DataLoaders ─────────────────────────────────────────────────────────
-    pin = (device.type == 'cuda')
-    train_loader = DataLoader(PoseDataset(X_train, y_train),
-                              batch_size=BATCH_SIZE, shuffle=True,
-                              num_workers=NUM_WORKERS, pin_memory=pin)
-    val_loader   = DataLoader(PoseDataset(X_val, y_val),
-                              batch_size=BATCH_SIZE, shuffle=False,
-                              num_workers=NUM_WORKERS, pin_memory=pin)
-    test_loader  = DataLoader(PoseDataset(X_test, y_test),
-                              batch_size=BATCH_SIZE, shuffle=False,
-                              num_workers=NUM_WORKERS, pin_memory=pin)
+    # Apply correct transforms to each split
+    train_dataset = datasets.ImageFolder(FRAMES_DIR, transform=train_tf)
+    val_dataset   = datasets.ImageFolder(FRAMES_DIR, transform=val_tf)
+
+    train_subset  = Subset(train_dataset, train_idx)
+    val_subset    = Subset(val_dataset,   val_idx)
+
+    print(f"  Train frames : {len(train_subset)}")
+    print(f"  Val frames   : {len(val_subset)}\n")
+
+    # ── DataLoaders ──────────────────────────────────────────────────────────
+    train_labels  = all_labels[train_idx]
+    sampler       = make_weighted_sampler(train_labels)
+    pin           = (device.type == 'cuda')
+
+    train_loader = DataLoader(train_subset, batch_size=BATCH_SIZE,
+                              sampler=sampler, num_workers=NUM_WORKERS,
+                              pin_memory=pin)
+    val_loader   = DataLoader(val_subset,   batch_size=BATCH_SIZE,
+                              shuffle=False, num_workers=NUM_WORKERS,
+                              pin_memory=pin)
 
     # ── Model ────────────────────────────────────────────────────────────────
-    model = ActionLSTM(input_size, HIDDEN_SIZE, NUM_LAYERS, num_classes).to(device)
-    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"  Model parameters : {total_params:,}\n")
+    model = LiquidClassifier(num_classes=num_classes, freeze_backbone=True).to(device)
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total     = sum(p.numel() for p in model.parameters())
+    print(f"  Trainable parameters : {trainable:,} / {total:,} (backbone frozen)\n")
 
     # ── Loss / Optimiser / Scheduler ─────────────────────────────────────────
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=10, min_lr=1e-6, verbose=True)
+    optimizer = optim.AdamW(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY
+    )
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
 
     # ── Training loop ────────────────────────────────────────────────────────
-    print(f"Starting training for up to {EPOCHS} epochs  (early-stop patience={PATIENCE})...\n")
-    best_val_loss  = float('inf')
+    print(f"Starting training - up to {EPOCHS} epochs (early-stop patience={PATIENCE})...\n")
+    best_val_loss     = float('inf')
+    best_model_wts    = copy.deepcopy(model.state_dict())
     epochs_no_improve = 0
-    best_model_path = 'action_model_best.pth'
 
     for epoch in range(1, EPOCHS + 1):
         # --- Train ---
         model.train()
-        train_loss = 0.0
-        loop = tqdm(train_loader, desc=f"Epoch {epoch:>3}/{EPOCHS} [train]",
+        running_loss = 0.0
+        loop = tqdm(train_loader, desc=f"Epoch {epoch:>2}/{EPOCHS} [train]",
                     leave=False, unit="batch")
-        for batch_X, batch_y in loop:
-            batch_X, batch_y = batch_X.to(device, non_blocking=True), \
-                               batch_y.to(device, non_blocking=True)
+        for imgs, labels in loop:
+            imgs, labels = imgs.to(device, non_blocking=True), \
+                           labels.to(device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
-            outputs = model(batch_X)
-            loss = criterion(outputs, batch_y)
+            outputs = model(imgs)
+            loss    = criterion(outputs, labels)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
-            train_loss += loss.item()
+            running_loss += loss.item()
             loop.set_postfix(loss=f"{loss.item():.4f}")
 
-        avg_train_loss = train_loss / len(train_loader)
+        avg_train_loss = running_loss / len(train_loader)
 
         # --- Validate ---
-        val_loss, val_acc = evaluate(model, val_loader, criterion, device)
-        scheduler.step(val_loss)
+        val_loss, val_acc, _, _ = evaluate(model, val_loader, criterion, device)
+        scheduler.step()
 
-        # --- Log ---
-        print(f"Epoch {epoch:>3}/{EPOCHS}  "
+        print(f"Epoch {epoch:>2}/{EPOCHS}  "
               f"train_loss={avg_train_loss:.4f}  "
               f"val_loss={val_loss:.4f}  "
               f"val_acc={val_acc:.1f}%  "
@@ -158,9 +197,11 @@ def main():
 
         # --- Best model checkpoint ---
         if val_loss < best_val_loss:
-            best_val_loss = val_loss
+            best_val_loss  = val_loss
+            best_model_wts = copy.deepcopy(model.state_dict())
             epochs_no_improve = 0
-            torch.save(model.state_dict(), best_model_path)
+            torch.save(best_model_wts, MODEL_SAVE)
+            print(f"           [*] Best model saved  (val_loss={val_loss:.4f})")
         else:
             epochs_no_improve += 1
 
@@ -169,20 +210,26 @@ def main():
             print(f"\n[Early Stop] No improvement for {PATIENCE} epochs. Stopping.")
             break
 
-    # ── Final evaluation on test set ─────────────────────────────────────────
-    print(f"\nLoading best model from '{best_model_path}'...")
-    model.load_state_dict(torch.load(best_model_path, map_location=device))
-    test_loss, test_acc = evaluate(model, test_loader, criterion, device)
+    # ── Final evaluation ─────────────────────────────────────────────────────
+    print(f"\nLoading best model from '{MODEL_SAVE}'...")
+    model.load_state_dict(torch.load(MODEL_SAVE, map_location=device))
+    _, final_acc, preds, true_labels = evaluate(model, val_loader, criterion, device)
 
     print(f"\n{'='*60}")
-    print(f"  Test Loss     : {test_loss:.4f}")
-    print(f"  Test Accuracy : {test_acc:.2f}%")
-    print(f"{'='*60}\n")
+    print(f"  Final Val Accuracy : {final_acc:.2f}%")
+    print(f"{'='*60}")
 
-    # Save final model (same weights as best)
-    torch.save(model.state_dict(), 'action_model.pth')
-    print("Saved  ->  action_model.pth  (best checkpoint)")
-    print("Saved  ->  action_model_best.pth  (same best checkpoint, kept separately)")
+    print("\nConfusion Matrix:")
+    print(confusion_matrix(true_labels, preds))
+
+    print("\nClassification Report:")
+    print(classification_report(true_labels, preds, target_names=classes))
+
+    # Save class names for inference
+    np.save(LABELS_SAVE, np.array(classes))
+    print(f"Saved -> {MODEL_SAVE}")
+    print(f"Saved -> {LABELS_SAVE}")
+    print("\nNext step -> run:  python phase4_realtime_inference.py")
 
 
 if __name__ == '__main__':
